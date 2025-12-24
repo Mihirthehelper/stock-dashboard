@@ -24,6 +24,10 @@ shares = st.sidebar.number_input(
     format="%d"
 )
 
+# New: moving average toggles
+show_sma50 = st.sidebar.checkbox("Show 50-period SMA", value=False, help="Simple moving average using a 50-row window. For daily data this is 50 trading days.")
+show_sma200 = st.sidebar.checkbox("Show 200-period SMA", value=False, help="Simple moving average using a 200-row window. For daily data this is 200 trading days.")
+
 # Map selected period to yfinance period and interval
 PERIOD_INTERVAL_MAP = {
     "1d": {"period": "1d", "interval": "1m"},
@@ -206,11 +210,66 @@ with st.sidebar:
 # Main display: chart, metrics, raw data
 if history is not None and not history.empty and "Close" in history.columns:
     st.subheader(f"{ticker} Price ({period})")
-    st.line_chart(history["Close"])
+
+    # Work on a copy to avoid mutating original
+    df = history.copy()
+
+    # Compute moving averages if requested
+    # Note: window counts rows. For intraday data (minute, 5m, etc.), "50" means 50 rows, not 50 trading days.
+    if show_sma50:
+        df["SMA50"] = df["Close"].rolling(window=50, min_periods=1).mean()
+    if show_sma200:
+        df["SMA200"] = df["Close"].rolling(window=200, min_periods=1).mean()
+
+    # Build chart dataframe including only requested columns
+    chart_cols = ["Close"]
+    if show_sma50:
+        chart_cols.append("SMA50")
+    if show_sma200:
+        chart_cols.append("SMA200")
+
+    # Plot using st.line_chart which accepts a DataFrame
+    try:
+        st.line_chart(df[chart_cols])
+    except Exception:
+        # Fallback: if line_chart fails for any reason, plot Close only
+        st.line_chart(df["Close"])
+        st.error("Failed to plot SMAs — showing Close only.")
+
+    # Informational note about interpretation for intraday data
+    params = PERIOD_INTERVAL_MAP.get(period, {})
+    interval = params.get("interval", "")
+    if interval != "1d" and (show_sma50 or show_sma200):
+        st.caption(
+            "Note: The SMA windows are measured in rows (intervals). For intraday intervals (1m, 5m, 15m, 60m) "
+            "the 50/200 windows count data rows, not calendar trading days. If you want 50/200 trading-day SMAs "
+            "on intraday data, I can resample to daily closes and then compute the SMAs."
+        )
+
+    # Key metrics (Close.describe) and last values of SMAs
     st.subheader(f"Key Metrics for {ticker} ({period})")
-    st.write(history["Close"].describe())
+    st.write(df["Close"].describe())
+
+    # Show latest SMA values (if present)
+    sma_latest = {}
+    if show_sma50 and "SMA50" in df.columns:
+        sma_latest["SMA50"] = df["SMA50"].iloc[-1]
+    if show_sma200 and "SMA200" in df.columns:
+        sma_latest["SMA200"] = df["SMA200"].iloc[-1]
+    if sma_latest:
+        st.write("Latest moving average values:")
+        # Format nicely
+        sma_display = {k: f"${v:,.2f}" for k, v in sma_latest.items()}
+        st.json(sma_display)
+
     st.subheader("Raw Data (last 100 rows)")
-    st.write(history.tail(100))
+    # Include SMA columns in raw data if they exist
+    display_cols = ["Close"]
+    if "SMA50" in df.columns:
+        display_cols.append("SMA50")
+    if "SMA200" in df.columns:
+        display_cols.append("SMA200")
+    st.write(df[display_cols].tail(100))
 else:
     # If no multi-row history available, but we have a latest_price, show a single-point chart (so UI has a chart)
     st.warning("No historical data found for the selected period. Showing latest quote if available.")

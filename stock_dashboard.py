@@ -4,12 +4,23 @@ import pandas as pd
 import datetime
 import requests
 from typing import List, Dict, Any, Optional
+import os
+import time
 
 st.set_page_config(page_title="Stock Market Dashboard", layout="wide")
 st.title("Stock Market Dashboard")
 
-# ---------- Sidebar: search + ticker selection (autocomplete-like) ----------
-# User types a query; we call Yahoo's search endpoint to get suggestions.
+# Visible version/timestamp so you can confirm you're running the updated file
+APP_VERSION = "v3 — SMA + fundamentals + autocomplete (button suggestions)"
+try:
+    mod_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(__file__)))
+except Exception:
+    mod_ts = "unknown"
+
+st.sidebar.markdown(f"**App version:** {APP_VERSION}")
+st.sidebar.markdown(f"Last file edit: `{mod_ts}`")
+
+# ---------- Sidebar: search + ticker selection (immediate clickable suggestions) ----------
 @st.cache_data(ttl=60)
 def search_tickers(query: str, limit: int = 10) -> List[Dict[str, Any]]:
     """
@@ -25,10 +36,8 @@ def search_tickers(query: str, limit: int = 10) -> List[Dict[str, Any]]:
         resp.raise_for_status()
         data = resp.json()
         quotes = data.get("quotes", []) or []
-        # Keep only items that look like tradable symbols
         results = []
         for q in quotes:
-            # filter out non-equities if desired (has 'quoteType' e.g., 'EQUITY')
             symbol = q.get("symbol")
             if not symbol:
                 continue
@@ -38,25 +47,37 @@ def search_tickers(query: str, limit: int = 10) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-# Provide a text input that the user types into and a selectable list of suggestions.
-search_query = st.sidebar.text_input("Search Ticker (type to get suggestions)", value="AAPL", key="search_input")
+# Initialize session state keys used for the autocomplete behavior
+if "selected_ticker" not in st.session_state:
+    st.session_state["selected_ticker"] = None
+if "last_query" not in st.session_state:
+    st.session_state["last_query"] = ""
+
+# Text input where user types; suggestions appear as up-to-3 clickable buttons below
+search_query = st.sidebar.text_input("Search Ticker (type then click one of the three suggestions)", value="AAPL", key="search_input")
+
+# Reset selected_ticker when the user types a new query (so clicking is explicit)
+if search_query != st.session_state["last_query"]:
+    st.session_state["selected_ticker"] = None
+    st.session_state["last_query"] = search_query
+
+# Fetch suggestions (cached)
 suggestions = search_tickers(search_query) if search_query else []
 
-# Build options. First option keeps the typed value; subsequent options are suggestions.
-suggestion_strings = [f"{s['symbol']} — {s['name']}" if s.get("name") else s["symbol"] for s in suggestions]
-options = [f"Use typed: {search_query}"] + suggestion_strings if search_query else suggestion_strings
+# Display up to 3 clickable suggestions (not a selectbox). Clicking sets the input and selects the ticker.
+if suggestions:
+    st.sidebar.markdown("Suggestions (click to choose):")
+    for i, s in enumerate(suggestions[:3]):
+        sym = s["symbol"]
+        name = s.get("name", "")
+        # show as simple button; when clicked, update session_state and rerun so the text_input reflects the selection
+        if st.sidebar.button(f"{sym}  {('— ' + name) if name else ''}", key=f"sugg_{i}"):
+            st.session_state["search_input"] = sym
+            st.session_state["selected_ticker"] = sym
+            st.experimental_rerun()
 
-selected_suggestion = None
-if options:
-    selected = st.sidebar.selectbox("Suggestions", options=options, index=0)
-    if selected.startswith("Use typed: "):
-        ticker = search_query.upper().strip()
-    else:
-        # parse symbol out of "SYMBOL — Name"
-        ticker = selected.split(" — ")[0].upper().strip()
-else:
-    # fallback simple input if no suggestions
-    ticker = st.sidebar.text_input("Enter Stock Ticker (no suggestions available)", value="AAPL").upper().strip()
+# If the user clicked a suggestion earlier, use that; otherwise use the typed value
+ticker = (st.session_state["selected_ticker"] or search_query).upper().strip()
 
 # ---------- Other sidebar inputs ----------
 period = st.sidebar.selectbox(
@@ -248,7 +269,7 @@ def _extract_financial_metrics(tk: yf.Ticker) -> Dict[str, Optional[Any]]:
         info = {}
 
     # P/E ratio: prefer trailingPE, fall back to forwardPE or other keys
-    for pe_key in ("trailingPE", "trailingPE", "forwardPE", "pegRatio", "priceToEarnings"):
+    for pe_key in ("trailingPE", "forwardPE", "pegRatio", "priceToEarnings"):
         val = info.get(pe_key)
         if val is not None:
             pe = val
@@ -256,19 +277,16 @@ def _extract_financial_metrics(tk: yf.Ticker) -> Dict[str, Optional[Any]]:
 
     # revenue & gross profit from info if available
     if info:
-        revenue = info.get("totalRevenue") or info.get("revenue") or info.get("regularMarketPreviousClose") and None
-        # note: sometimes 'grossProfits' exists
+        revenue = info.get("totalRevenue") or info.get("revenue") or None
         gross_profit = info.get("grossProfits") or info.get("grossProfit") or None
 
     # 2) Try financials DataFrame(s) if needed
     def _search_financials_table(table: pd.DataFrame, keywords: List[str]) -> Optional[int]:
         if table is None or table.empty:
             return None
-        # search index names for a matching row
         for idx in table.index:
             lower = str(idx).lower()
             if all(k in lower for k in keywords):
-                # pick the first (most recent) column that is not NaN
                 try:
                     series = table.loc[idx].dropna()
                     if not series.empty:
@@ -277,16 +295,13 @@ def _extract_financial_metrics(tk: yf.Ticker) -> Dict[str, Optional[Any]]:
                     continue
         return None
 
-    # Try annual financials then quarterly
     try:
         fin = tk.financials
         if isinstance(fin, pd.DataFrame) and not fin.empty:
-            # revenue: look for 'revenue' in the index label
             if revenue is None:
                 rev_found = _search_financials_table(fin, ["revenue"])
                 if rev_found is not None:
                     revenue = rev_found
-            # gross profit: look for 'gross' and 'profit'
             if gross_profit is None:
                 gp_found = _search_financials_table(fin, ["gross", "profit"])
                 if gp_found is not None:
@@ -315,7 +330,6 @@ def _format_currency(value: Optional[float]) -> str:
     if value is None:
         return "N/A"
     try:
-        # show full dollars without decimals
         return f"${int(value):,}"
     except Exception:
         try:
@@ -370,7 +384,6 @@ if history is not None and not history.empty and "Close" in history.columns:
     df = history.copy()
 
     # Compute moving averages if requested
-    # Note: window counts rows. For intraday data (minute, 5m, etc.), "50" means 50 rows, not 50 trading days.
     if show_sma50:
         df["SMA50"] = df["Close"].rolling(window=50, min_periods=1).mean()
     if show_sma200:
@@ -387,11 +400,9 @@ if history is not None and not history.empty and "Close" in history.columns:
     try:
         st.line_chart(df[chart_cols])
     except Exception:
-        # Fallback: if line_chart fails for any reason, plot Close only
         st.line_chart(df["Close"])
         st.error("Failed to plot SMAs — showing Close only.")
 
-    # Informational note about interpretation for intraday data
     params = PERIOD_INTERVAL_MAP.get(period, {})
     interval = params.get("interval", "")
     if interval != "1d" and (show_sma50 or show_sma200):
@@ -436,7 +447,6 @@ if history is not None and not history.empty and "Close" in history.columns:
         st.json(sma_display)
 
     st.subheader("Raw Data (last 100 rows)")
-    # Include SMA columns in raw data if they exist
     display_cols = ["Close"]
     if "SMA50" in df.columns:
         display_cols.append("SMA50")
@@ -458,7 +468,6 @@ else:
             df_point = pd.DataFrame({"Close": [latest_price]}, index=[pd.to_datetime(last_timestamp)])
             st.line_chart(df_point["Close"])
         except Exception:
-            # if timestamp conversion fails, show a numeric metric instead
             st.metric(label=f"{ticker}", value=f"${latest_price:,.2f}")
     else:
         st.info("Please enter a valid stock ticker to begin or try again later.")

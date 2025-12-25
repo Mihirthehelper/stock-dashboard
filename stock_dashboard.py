@@ -2,84 +2,13 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import datetime
-import requests
-from typing import List, Dict, Any, Optional
-import os
-import time
 
 st.set_page_config(page_title="Stock Market Dashboard", layout="wide")
 st.title("Stock Market Dashboard")
 
-# Visible version/timestamp so you can confirm you're running the updated file
-APP_VERSION = "v3 — SMA + fundamentals + autocomplete (button suggestions)"
-try:
-    mod_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(__file__)))
-except Exception:
-    mod_ts = "unknown"
+# Sidebar inputs
+ticker = st.sidebar.text_input("Enter Stock Ticker", value="AAPL").upper().strip()
 
-st.sidebar.markdown(f"**App version:** {APP_VERSION}")
-st.sidebar.markdown(f"Last file edit: `{mod_ts}`")
-
-# ---------- Sidebar: search + ticker selection (immediate clickable suggestions) ----------
-@st.cache_data(ttl=60)
-def search_tickers(query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Query Yahoo Finance search API for matching tickers.
-    Returns a list of dicts containing at least 'symbol' and optionally 'shortname'/'longname'.
-    Cached for 60s to avoid hammering the API while the user types.
-    """
-    if not query:
-        return []
-    url = "https://query2.finance.yahoo.com/v1/finance/search"
-    try:
-        resp = requests.get(url, params={"q": query, "quotesCount": limit, "newsCount": 0}, timeout=3)
-        resp.raise_for_status()
-        data = resp.json()
-        quotes = data.get("quotes", []) or []
-        results = []
-        for q in quotes:
-            symbol = q.get("symbol")
-            if not symbol:
-                continue
-            name = q.get("shortname") or q.get("longname") or q.get("name") or ""
-            results.append({"symbol": symbol, "name": name, "quoteType": q.get("quoteType")})
-        return results
-    except Exception:
-        return []
-
-# Initialize session state keys used for the autocomplete behavior
-if "selected_ticker" not in st.session_state:
-    st.session_state["selected_ticker"] = None
-if "last_query" not in st.session_state:
-    st.session_state["last_query"] = ""
-
-# Text input where user types; suggestions appear as up-to-3 clickable buttons below
-search_query = st.sidebar.text_input("Search Ticker (type then click one of the three suggestions)", value="AAPL", key="search_input")
-
-# Reset selected_ticker when the user types a new query (so clicking is explicit)
-if search_query != st.session_state["last_query"]:
-    st.session_state["selected_ticker"] = None
-    st.session_state["last_query"] = search_query
-
-# Fetch suggestions (cached)
-suggestions = search_tickers(search_query) if search_query else []
-
-# Display up to 3 clickable suggestions (not a selectbox). Clicking sets the input and selects the ticker.
-if suggestions:
-    st.sidebar.markdown("Suggestions (click to choose):")
-    for i, s in enumerate(suggestions[:3]):
-        sym = s["symbol"]
-        name = s.get("name", "")
-        # show as simple button; when clicked, update session_state and rerun so the text_input reflects the selection
-        if st.sidebar.button(f"{sym}  {('— ' + name) if name else ''}", key=f"sugg_{i}"):
-            st.session_state["search_input"] = sym
-            st.session_state["selected_ticker"] = sym
-            st.experimental_rerun()
-
-# If the user clicked a suggestion earlier, use that; otherwise use the typed value
-ticker = (st.session_state["selected_ticker"] or search_query).upper().strip()
-
-# ---------- Other sidebar inputs ----------
 period = st.sidebar.selectbox(
     "Select Time Range",
     options=["1d", "1w", "1m", "3m", "1y", "5y"],
@@ -250,104 +179,6 @@ def fetch_latest_price(ticker_symbol: str):
     return None, None, "none"
 
 
-def _extract_financial_metrics(tk: yf.Ticker) -> Dict[str, Optional[Any]]:
-    """
-    Try to extract P/E ratio, total revenue, and gross profit from multiple sources:
-    - tk.info (fast)
-    - tk.financials (annual)
-    - tk.quarterly_financials (quarterly)
-    Returns dictionary with keys: 'pe', 'revenue', 'gross_profit'
-    """
-    pe = None
-    revenue = None
-    gross_profit = None
-
-    # 1) Try info dict first (fast)
-    try:
-        info = tk.info or {}
-    except Exception:
-        info = {}
-
-    # P/E ratio: prefer trailingPE, fall back to forwardPE or other keys
-    for pe_key in ("trailingPE", "forwardPE", "pegRatio", "priceToEarnings"):
-        val = info.get(pe_key)
-        if val is not None:
-            pe = val
-            break
-
-    # revenue & gross profit from info if available
-    if info:
-        revenue = info.get("totalRevenue") or info.get("revenue") or None
-        gross_profit = info.get("grossProfits") or info.get("grossProfit") or None
-
-    # 2) Try financials DataFrame(s) if needed
-    def _search_financials_table(table: pd.DataFrame, keywords: List[str]) -> Optional[int]:
-        if table is None or table.empty:
-            return None
-        for idx in table.index:
-            lower = str(idx).lower()
-            if all(k in lower for k in keywords):
-                try:
-                    series = table.loc[idx].dropna()
-                    if not series.empty:
-                        return int(series.iloc[0])
-                except Exception:
-                    continue
-        return None
-
-    try:
-        fin = tk.financials
-        if isinstance(fin, pd.DataFrame) and not fin.empty:
-            if revenue is None:
-                rev_found = _search_financials_table(fin, ["revenue"])
-                if rev_found is not None:
-                    revenue = rev_found
-            if gross_profit is None:
-                gp_found = _search_financials_table(fin, ["gross", "profit"])
-                if gp_found is not None:
-                    gross_profit = gp_found
-    except Exception:
-        pass
-
-    try:
-        qfin = tk.quarterly_financials
-        if isinstance(qfin, pd.DataFrame) and not qfin.empty:
-            if revenue is None:
-                rev_found = _search_financials_table(qfin, ["revenue"])
-                if rev_found is not None:
-                    revenue = rev_found
-            if gross_profit is None:
-                gp_found = _search_financials_table(qfin, ["gross", "profit"])
-                if gp_found is not None:
-                    gross_profit = gp_found
-    except Exception:
-        pass
-
-    return {"pe": pe, "revenue": revenue, "gross_profit": gross_profit}
-
-
-def _format_currency(value: Optional[float]) -> str:
-    if value is None:
-        return "N/A"
-    try:
-        return f"${int(value):,}"
-    except Exception:
-        try:
-            return f"${value:,.2f}"
-        except Exception:
-            return str(value)
-
-
-def _format_number(value: Optional[float]) -> str:
-    if value is None:
-        return "N/A"
-    try:
-        return f"{value:,.2f}"
-    except Exception:
-        return str(value)
-
-
-# ---------- Main app logic ----------
 # Only proceed if a ticker is provided
 if not ticker:
     st.sidebar.info("Please enter a stock ticker to begin.")
@@ -376,7 +207,7 @@ with st.sidebar:
     else:
         st.warning("Could not fetch latest price. Please check the ticker symbol or your internet connection.")
 
-# ---------- Main display: chart, metrics, raw data ----------
+# Main display: chart, metrics, raw data
 if history is not None and not history.empty and "Close" in history.columns:
     st.subheader(f"{ticker} Price ({period})")
 
@@ -384,6 +215,7 @@ if history is not None and not history.empty and "Close" in history.columns:
     df = history.copy()
 
     # Compute moving averages if requested
+    # Note: window counts rows. For intraday data (minute, 5m, etc.), "50" means 50 rows, not 50 trading days.
     if show_sma50:
         df["SMA50"] = df["Close"].rolling(window=50, min_periods=1).mean()
     if show_sma200:
@@ -400,9 +232,11 @@ if history is not None and not history.empty and "Close" in history.columns:
     try:
         st.line_chart(df[chart_cols])
     except Exception:
+        # Fallback: if line_chart fails for any reason, plot Close only
         st.line_chart(df["Close"])
         st.error("Failed to plot SMAs — showing Close only.")
 
+    # Informational note about interpretation for intraday data
     params = PERIOD_INTERVAL_MAP.get(period, {})
     interval = params.get("interval", "")
     if interval != "1d" and (show_sma50 or show_sma200):
@@ -412,28 +246,9 @@ if history is not None and not history.empty and "Close" in history.columns:
             "on intraday data, I can resample to daily closes and then compute the SMAs."
         )
 
-    # Key metrics (Close.describe) and additional fundamentals: P/E ratio, revenue, gross profit
+    # Key metrics (Close.describe) and last values of SMAs
     st.subheader(f"Key Metrics for {ticker} ({period})")
     st.write(df["Close"].describe())
-
-    # Fetch fundamentals
-    tk = yf.Ticker(ticker)
-    fundamentals = _extract_financial_metrics(tk)
-    pe = fundamentals.get("pe")
-    revenue = fundamentals.get("revenue")
-    gross_profit = fundamentals.get("gross_profit")
-
-    # Present the metrics in three columns
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("**P/E Ratio**")
-        st.write(_format_number(pe) if pe is not None else "N/A")
-    with col2:
-        st.markdown("**Total Revenue (most recent)**")
-        st.write(_format_currency(revenue))
-    with col3:
-        st.markdown("**Gross Profit (most recent)**")
-        st.write(_format_currency(gross_profit))
 
     # Show latest SMA values (if present)
     sma_latest = {}
@@ -443,10 +258,12 @@ if history is not None and not history.empty and "Close" in history.columns:
         sma_latest["SMA200"] = df["SMA200"].iloc[-1]
     if sma_latest:
         st.write("Latest moving average values:")
+        # Format nicely
         sma_display = {k: f"${v:,.2f}" for k, v in sma_latest.items()}
         st.json(sma_display)
 
     st.subheader("Raw Data (last 100 rows)")
+    # Include SMA columns in raw data if they exist
     display_cols = ["Close"]
     if "SMA50" in df.columns:
         display_cols.append("SMA50")
@@ -468,6 +285,7 @@ else:
             df_point = pd.DataFrame({"Close": [latest_price]}, index=[pd.to_datetime(last_timestamp)])
             st.line_chart(df_point["Close"])
         except Exception:
+            # if timestamp conversion fails, show a numeric metric instead
             st.metric(label=f"{ticker}", value=f"${latest_price:,.2f}")
     else:
         st.info("Please enter a valid stock ticker to begin or try again later.")

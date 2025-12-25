@@ -2,13 +2,63 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import datetime
+import requests
+from typing import List, Dict, Any, Optional
 
 st.set_page_config(page_title="Stock Market Dashboard", layout="wide")
 st.title("Stock Market Dashboard")
 
-# Sidebar inputs
-ticker = st.sidebar.text_input("Enter Stock Ticker", value="AAPL").upper().strip()
+# ---------- Sidebar: search + ticker selection (autocomplete-like) ----------
+# User types a query; we call Yahoo's search endpoint to get suggestions.
+@st.cache_data(ttl=60)
+def search_tickers(query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Query Yahoo Finance search API for matching tickers.
+    Returns a list of dicts containing at least 'symbol' and optionally 'shortname'/'longname'.
+    Cached for 60s to avoid hammering the API while the user types.
+    """
+    if not query:
+        return []
+    url = "https://query2.finance.yahoo.com/v1/finance/search"
+    try:
+        resp = requests.get(url, params={"q": query, "quotesCount": limit, "newsCount": 0}, timeout=3)
+        resp.raise_for_status()
+        data = resp.json()
+        quotes = data.get("quotes", []) or []
+        # Keep only items that look like tradable symbols
+        results = []
+        for q in quotes:
+            # filter out non-equities if desired (has 'quoteType' e.g., 'EQUITY')
+            symbol = q.get("symbol")
+            if not symbol:
+                continue
+            name = q.get("shortname") or q.get("longname") or q.get("name") or ""
+            results.append({"symbol": symbol, "name": name, "quoteType": q.get("quoteType")})
+        return results
+    except Exception:
+        return []
 
+# Provide a text input that the user types into and a selectable list of suggestions.
+search_query = st.sidebar.text_input("Search Ticker (type to get suggestions)", value="AAPL", key="search_input")
+suggestions = search_tickers(search_query) if search_query else []
+
+# Build options. First option keeps the typed value; subsequent options are suggestions.
+suggestion_strings = [f"{s['symbol']} — {s['name']}" if s.get("name") else s["symbol"] for s in suggestions]
+options = [f"Use typed: {search_query}"] + suggestion_strings if search_query else suggestion_strings
+
+selected_suggestion = None
+if options:
+    selected = st.sidebar.selectbox("Suggestions", options=options, index=0)
+    if selected.startswith("Use typed: "):
+        ticker = search_query.upper().strip()
+    else:
+        # parse symbol out of "SYMBOL — Name"
+        ticker = selected.split(" — ")[0].upper().strip()
+else:
+    # fallback simple input if no suggestions
+    ticker = st.sidebar.text_input("Enter Stock Ticker (no suggestions available)", value="AAPL").upper().strip()
+
+# ---------- Other sidebar inputs ----------
 period = st.sidebar.selectbox(
     "Select Time Range",
     options=["1d", "1w", "1m", "3m", "1y", "5y"],
@@ -179,6 +229,111 @@ def fetch_latest_price(ticker_symbol: str):
     return None, None, "none"
 
 
+def _extract_financial_metrics(tk: yf.Ticker) -> Dict[str, Optional[Any]]:
+    """
+    Try to extract P/E ratio, total revenue, and gross profit from multiple sources:
+    - tk.info (fast)
+    - tk.financials (annual)
+    - tk.quarterly_financials (quarterly)
+    Returns dictionary with keys: 'pe', 'revenue', 'gross_profit'
+    """
+    pe = None
+    revenue = None
+    gross_profit = None
+
+    # 1) Try info dict first (fast)
+    try:
+        info = tk.info or {}
+    except Exception:
+        info = {}
+
+    # P/E ratio: prefer trailingPE, fall back to forwardPE or other keys
+    for pe_key in ("trailingPE", "trailingPE", "forwardPE", "pegRatio", "priceToEarnings"):
+        val = info.get(pe_key)
+        if val is not None:
+            pe = val
+            break
+
+    # revenue & gross profit from info if available
+    if info:
+        revenue = info.get("totalRevenue") or info.get("revenue") or info.get("regularMarketPreviousClose") and None
+        # note: sometimes 'grossProfits' exists
+        gross_profit = info.get("grossProfits") or info.get("grossProfit") or None
+
+    # 2) Try financials DataFrame(s) if needed
+    def _search_financials_table(table: pd.DataFrame, keywords: List[str]) -> Optional[int]:
+        if table is None or table.empty:
+            return None
+        # search index names for a matching row
+        for idx in table.index:
+            lower = str(idx).lower()
+            if all(k in lower for k in keywords):
+                # pick the first (most recent) column that is not NaN
+                try:
+                    series = table.loc[idx].dropna()
+                    if not series.empty:
+                        return int(series.iloc[0])
+                except Exception:
+                    continue
+        return None
+
+    # Try annual financials then quarterly
+    try:
+        fin = tk.financials
+        if isinstance(fin, pd.DataFrame) and not fin.empty:
+            # revenue: look for 'revenue' in the index label
+            if revenue is None:
+                rev_found = _search_financials_table(fin, ["revenue"])
+                if rev_found is not None:
+                    revenue = rev_found
+            # gross profit: look for 'gross' and 'profit'
+            if gross_profit is None:
+                gp_found = _search_financials_table(fin, ["gross", "profit"])
+                if gp_found is not None:
+                    gross_profit = gp_found
+    except Exception:
+        pass
+
+    try:
+        qfin = tk.quarterly_financials
+        if isinstance(qfin, pd.DataFrame) and not qfin.empty:
+            if revenue is None:
+                rev_found = _search_financials_table(qfin, ["revenue"])
+                if rev_found is not None:
+                    revenue = rev_found
+            if gross_profit is None:
+                gp_found = _search_financials_table(qfin, ["gross", "profit"])
+                if gp_found is not None:
+                    gross_profit = gp_found
+    except Exception:
+        pass
+
+    return {"pe": pe, "revenue": revenue, "gross_profit": gross_profit}
+
+
+def _format_currency(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        # show full dollars without decimals
+        return f"${int(value):,}"
+    except Exception:
+        try:
+            return f"${value:,.2f}"
+        except Exception:
+            return str(value)
+
+
+def _format_number(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return f"{value:,.2f}"
+    except Exception:
+        return str(value)
+
+
+# ---------- Main app logic ----------
 # Only proceed if a ticker is provided
 if not ticker:
     st.sidebar.info("Please enter a stock ticker to begin.")
@@ -207,7 +362,7 @@ with st.sidebar:
     else:
         st.warning("Could not fetch latest price. Please check the ticker symbol or your internet connection.")
 
-# Main display: chart, metrics, raw data
+# ---------- Main display: chart, metrics, raw data ----------
 if history is not None and not history.empty and "Close" in history.columns:
     st.subheader(f"{ticker} Price ({period})")
 
@@ -246,9 +401,28 @@ if history is not None and not history.empty and "Close" in history.columns:
             "on intraday data, I can resample to daily closes and then compute the SMAs."
         )
 
-    # Key metrics (Close.describe) and last values of SMAs
+    # Key metrics (Close.describe) and additional fundamentals: P/E ratio, revenue, gross profit
     st.subheader(f"Key Metrics for {ticker} ({period})")
     st.write(df["Close"].describe())
+
+    # Fetch fundamentals
+    tk = yf.Ticker(ticker)
+    fundamentals = _extract_financial_metrics(tk)
+    pe = fundamentals.get("pe")
+    revenue = fundamentals.get("revenue")
+    gross_profit = fundamentals.get("gross_profit")
+
+    # Present the metrics in three columns
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("**P/E Ratio**")
+        st.write(_format_number(pe) if pe is not None else "N/A")
+    with col2:
+        st.markdown("**Total Revenue (most recent)**")
+        st.write(_format_currency(revenue))
+    with col3:
+        st.markdown("**Gross Profit (most recent)**")
+        st.write(_format_currency(gross_profit))
 
     # Show latest SMA values (if present)
     sma_latest = {}
@@ -258,7 +432,6 @@ if history is not None and not history.empty and "Close" in history.columns:
         sma_latest["SMA200"] = df["SMA200"].iloc[-1]
     if sma_latest:
         st.write("Latest moving average values:")
-        # Format nicely
         sma_display = {k: f"${v:,.2f}" for k, v in sma_latest.items()}
         st.json(sma_display)
 

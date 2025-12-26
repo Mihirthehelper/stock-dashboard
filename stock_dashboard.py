@@ -350,20 +350,18 @@ def fetch_fundamentals(ticker_symbol: str):
 
 
 # ----------------------
-# New helper: render fundamentals in one table (P/E, Revenue, Gross Profit)
+# New helper: render fundamentals in one table (Revenue, Gross Profit, Revenue YoY %)
 # ----------------------
 def render_fundamentals_table(funds: dict):
     """
-    Build and display a table combining P/E, Revenue and Gross Profit for up to the last 5 years.
+    Build and display a table combining Revenue, Gross Profit and Year-over-Year Revenue Growth (%) for up to the last 5 years.
     - funds["revenue"] and funds["gross"] are expected to be lists of (year, value)
       where year may be string/int and value is numeric.
-    - funds["pe"] is a single float (current trailing/forward).
     """
-    pe = funds.get("pe")
     revenue = funds.get("revenue") or []
     gross = funds.get("gross") or []
 
-    # Build maps year->value
+    # Build maps year->value (strings for keys)
     rev_map = {}
     gross_map = {}
     for y, v in revenue:
@@ -384,14 +382,32 @@ def render_fundamentals_table(funds: dict):
     # limit to 5 years
     years_int = years_int[:5]
 
+    # Build revenue growth % (YoY) using ascending order
+    rev_growth_map = {}
+    if years_int:
+        years_asc = sorted(years_int)
+        for idx, yi in enumerate(years_asc):
+            ystr = str(yi)
+            try:
+                curr = rev_map.get(ystr)
+                prev = None
+                if idx > 0:
+                    prev = rev_map.get(str(years_asc[idx - 1]))
+                growth = None
+                if prev is not None and curr is not None and prev != 0:
+                    growth = (curr - prev) / abs(prev) * 100.0
+                rev_growth_map[ystr] = growth
+            except Exception:
+                rev_growth_map[ystr] = None
+
     rows = []
     if years_int:
         for yi in years_int:
             ystr = str(yi)
             row = {
                 "Year": ystr,
-                "P/E": pe if pe is not None else None,
                 "Revenue": rev_map.get(ystr),
+                "Revenue YoY %": rev_growth_map.get(ystr),
                 "Gross Profit": gross_map.get(ystr),
             }
             rows.append(row)
@@ -400,8 +416,8 @@ def render_fundamentals_table(funds: dict):
         current_year = str(datetime.datetime.now().year)
         rows.append({
             "Year": current_year,
-            "P/E": pe if pe is not None else None,
             "Revenue": rev_map.get(current_year),
+            "Revenue YoY %": None,
             "Gross Profit": gross_map.get(current_year),
         })
 
@@ -409,11 +425,18 @@ def render_fundamentals_table(funds: dict):
 
     # Format for display
     df_display = df.copy()
-    df_display["P/E"] = df_display["P/E"].apply(lambda v: f"{v:.2f}" if v is not None else "N/A")
     df_display["Revenue"] = df_display["Revenue"].apply(lambda v: f"${v:,.0f}" if v is not None else "N/A")
+    def fmt_pct(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "N/A"
+        try:
+            return f"{v:.2f}%"
+        except Exception:
+            return "N/A"
+    df_display["Revenue YoY %"] = df_display["Revenue YoY %"].apply(fmt_pct)
     df_display["Gross Profit"] = df_display["Gross Profit"].apply(lambda v: f"${v:,.0f}" if v is not None else "N/A")
 
-    st.markdown("#### Fundamentals (P/E, Revenue & Gross Profit — past years)")
+    st.markdown("#### Fundamentals (Revenue, Gross Profit & Revenue YoY% — past years)")
     st.table(df_display)
 
 
@@ -481,7 +504,14 @@ if history is not None and not history.empty and "Close" in history.columns:
             "on intraday data, I can resample to daily closes and then compute the SMAs."
         )
 
-    # Fundamentals section: combined table (P/E, revenue and gross profit)
+    # Show P/E separately (keep it out of the table)
+    pe = funds.get("pe")
+    if pe is not None:
+        st.write(f"P/E ratio (trailing/forward): {pe:.2f}")
+    else:
+        st.write("P/E ratio: N/A")
+
+    # Fundamentals section: combined table (Revenue, Gross Profit, Revenue YoY %)
     render_fundamentals_table(funds)
 
     sma_latest = {}
@@ -511,7 +541,14 @@ else:
             ts_text = str(last_timestamp)
         st.write(f"Latest price for {ticker}: ${latest_price:,.2f} (as of {ts_text}, source: {price_source})")
 
-        # Fundamentals section: combined table (P/E, revenue and gross profit)
+        # Show P/E separately (keep it out of the table)
+        pe = funds.get("pe")
+        if pe is not None:
+            st.write(f"P/E ratio (trailing/forward): {pe:.2f}")
+        else:
+            st.write("P/E ratio: N/A")
+
+        # Fundamentals section: combined table (Revenue, Gross Profit, Revenue YoY %)
         render_fundamentals_table(funds)
 
         try:

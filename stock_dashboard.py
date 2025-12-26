@@ -350,6 +350,74 @@ def fetch_fundamentals(ticker_symbol: str):
 
 
 # ----------------------
+# New helper: render fundamentals in one table (P/E, Revenue, Gross Profit)
+# ----------------------
+def render_fundamentals_table(funds: dict):
+    """
+    Build and display a table combining P/E, Revenue and Gross Profit for up to the last 5 years.
+    - funds["revenue"] and funds["gross"] are expected to be lists of (year, value)
+      where year may be string/int and value is numeric.
+    - funds["pe"] is a single float (current trailing/forward).
+    """
+    pe = funds.get("pe")
+    revenue = funds.get("revenue") or []
+    gross = funds.get("gross") or []
+
+    # Build maps year->value
+    rev_map = {}
+    gross_map = {}
+    for y, v in revenue:
+        rev_map[str(y)] = v
+    for y, v in gross:
+        gross_map[str(y)] = v
+
+    # Collect candidate years (as ints when possible) and sort descending (most recent first)
+    years_int = []
+    for ys in list(set(list(rev_map.keys()) + list(gross_map.keys()))):
+        try:
+            yi = int(str(ys)[:4])
+            years_int.append(yi)
+        except Exception:
+            pass
+
+    years_int = sorted(set(years_int), reverse=True)
+    # limit to 5 years
+    years_int = years_int[:5]
+
+    rows = []
+    if years_int:
+        for yi in years_int:
+            ystr = str(yi)
+            row = {
+                "Year": ystr,
+                "P/E": pe if pe is not None else None,
+                "Revenue": rev_map.get(ystr),
+                "Gross Profit": gross_map.get(ystr),
+            }
+            rows.append(row)
+    else:
+        # No annual rows found: show current year as a fallback (single-row)
+        current_year = str(datetime.datetime.now().year)
+        rows.append({
+            "Year": current_year,
+            "P/E": pe if pe is not None else None,
+            "Revenue": rev_map.get(current_year),
+            "Gross Profit": gross_map.get(current_year),
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Format for display
+    df_display = df.copy()
+    df_display["P/E"] = df_display["P/E"].apply(lambda v: f"{v:.2f}" if v is not None else "N/A")
+    df_display["Revenue"] = df_display["Revenue"].apply(lambda v: f"${v:,.0f}" if v is not None else "N/A")
+    df_display["Gross Profit"] = df_display["Gross Profit"].apply(lambda v: f"${v:,.0f}" if v is not None else "N/A")
+
+    st.markdown("#### Fundamentals (P/E, Revenue & Gross Profit — past years)")
+    st.table(df_display)
+
+
+# ----------------------
 # Main app logic
 # ----------------------
 # Only proceed if a ticker is provided
@@ -413,48 +481,8 @@ if history is not None and not history.empty and "Close" in history.columns:
             "on intraday data, I can resample to daily closes and then compute the SMAs."
         )
 
-    # Fundamentals section (P/E, revenue and gross profit history)
-    st.subheader("Fundamentals (P/E, Revenue & Gross Profit)")
-
-    pe = funds.get("pe")
-    if pe is not None:
-        st.write(f"P/E ratio (trailing/forward): {pe:.2f}")
-    else:
-        st.write("P/E ratio: N/A")
-
-    rev = funds.get("revenue")
-    if rev:
-        rev_df = pd.DataFrame(rev, columns=["Year", "Revenue"])
-        rev_df["Revenue"] = rev_df["Revenue"].apply(lambda v: f"${v:,.0f}")
-        st.markdown("#### Revenue (past years)")
-        st.table(rev_df)
-        rev_pct = funds.get("revenue_change_pct")
-        rev_cagr = funds.get("revenue_cagr_pct")
-        if rev_pct is not None:
-            st.write(f"Revenue change (first -> last): {rev_pct:.2f}%")
-        else:
-            st.write("Revenue change: N/A")
-        if rev_cagr is not None:
-            st.write(f"Revenue CAGR (annualized): {rev_cagr:.2f}%")
-    else:
-        st.write("Revenue data (annual) not available via yfinance for this ticker.")
-
-    gross = funds.get("gross")
-    if gross:
-        gross_df = pd.DataFrame(gross, columns=["Year", "Gross Profit"])
-        gross_df["Gross Profit"] = gross_df["Gross Profit"].apply(lambda v: f"${v:,.0f}")
-        st.markdown("#### Gross Profit (past years)")
-        st.table(gross_df)
-        gross_pct = funds.get("gross_change_pct")
-        gross_cagr = funds.get("gross_cagr_pct")
-        if gross_pct is not None:
-            st.write(f"Gross profit change (first -> last): {gross_pct:.2f}%")
-        else:
-            st.write("Gross profit change: N/A")
-        if gross_cagr is not None:
-            st.write(f"Gross profit CAGR (annualized): {gross_cagr:.2f}%")
-    else:
-        st.write("Gross profit data (annual) not available via yfinance for this ticker.")
+    # Fundamentals section: combined table (P/E, revenue and gross profit)
+    render_fundamentals_table(funds)
 
     sma_latest = {}
     if show_sma50 and "SMA50" in df.columns:
@@ -483,47 +511,8 @@ else:
             ts_text = str(last_timestamp)
         st.write(f"Latest price for {ticker}: ${latest_price:,.2f} (as of {ts_text}, source: {price_source})")
 
-        st.subheader("Fundamentals (P/E, Revenue & Gross Profit)")
-
-        pe = funds.get("pe")
-        if pe is not None:
-            st.write(f"P/E ratio (trailing/forward): {pe:.2f}")
-        else:
-            st.write("P/E ratio: N/A")
-
-        rev = funds.get("revenue")
-        if rev:
-            rev_df = pd.DataFrame(rev, columns=["Year", "Revenue"])
-            rev_df["Revenue"] = rev_df["Revenue"].apply(lambda v: f"${v:,.0f}")
-            st.markdown("#### Revenue (past years)")
-            st.table(rev_df)
-            rev_pct = funds.get("revenue_change_pct")
-            rev_cagr = funds.get("revenue_cagr_pct")
-            if rev_pct is not None:
-                st.write(f"Revenue change (first -> last): {rev_pct:.2f}%")
-            else:
-                st.write("Revenue change: N/A")
-            if rev_cagr is not None:
-                st.write(f"Revenue CAGR (annualized): {rev_cagr:.2f}%")
-        else:
-            st.write("Revenue data (annual) not available via yfinance for this ticker.")
-
-        gross = funds.get("gross")
-        if gross:
-            gross_df = pd.DataFrame(gross, columns=["Year", "Gross Profit"])
-            gross_df["Gross Profit"] = gross_df["Gross Profit"].apply(lambda v: f"${v:,.0f}")
-            st.markdown("#### Gross Profit (past years)")
-            st.table(gross_df)
-            gross_pct = funds.get("gross_change_pct")
-            gross_cagr = funds.get("gross_cagr_pct")
-            if gross_pct is not None:
-                st.write(f"Gross profit change (first -> last): {gross_pct:.2f}%")
-            else:
-                st.write("Gross profit change: N/A")
-            if gross_cagr is not None:
-                st.write(f"Gross profit CAGR (annualized): {gross_cagr:.2f}%")
-        else:
-            st.write("Gross profit data (annual) not available via yfinance for this ticker.")
+        # Fundamentals section: combined table (P/E, revenue and gross profit)
+        render_fundamentals_table(funds)
 
         try:
             # create a single-row series so the chart area still appears
